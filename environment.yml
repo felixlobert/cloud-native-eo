@@ -1,0 +1,21 @@
+name: cloud-native-eo
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python>=3.10
+  - jupyterlab
+  - pystac-client
+  - scipy
+  - odc-stac
+  - xarray
+  - planetary-computer
+  - dask
+  - pandas
+  - matplotlib
+  # Essential backend libraries for cloud-native streaming
+  - s3fs            # Required to stream Landsat from AWS Earth Search
+  - aiohttp         # Enables fast concurrent downloads in odc-stac
+  - rasterio        # Underlying engine for reading GeoTIFFs
+  - rioxarray       # Extension for xarray spatial operations
+  - pip
