@@ -151,10 +151,12 @@ plt.show()
 
 
 import numpy as np
-
-######################################################################
 import xarray as xr
 from scipy.stats import mode
+
+######################################################################
+# Analysis part 2 starts here
+# ######################################################################
 
 
 # 1. Wrapper to extract just the mode array and ignore NaNs/missing years
