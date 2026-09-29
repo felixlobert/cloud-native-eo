@@ -2,22 +2,18 @@
 eo_utils.py
 ===========
 
-Helper library for the **Cloud-Native Remote Sensing** workshop.
+Presentation and instrumentation helpers for the **Cloud-Native Remote Sensing**
+workshop.
 
-Everything that is boring, repetitive or simply too long to show live lives in
-this module.  The notebooks import from here so the audience can concentrate on
-the *cloud-native ideas* -- STAC, Cloud-Optimized GeoTIFFs and lazy Dask
-computation -- rather than on boilerplate.
+This module deliberately contains **only** the things you do not want to type
+live: plotting code, the animated-GIF builder, a small parser for the STAC
+classification extension, and the Dask introspection helpers.
 
-Design rules
-------------
-* Importing this module performs **no network access**.
-* Every function is documented, because the audience *will* read it.
-* Heavy or noisy code (masking rules, `apply_ufunc` plumbing, plotting) is
-  hidden behind small, well-named functions.
+All of the *workflow* -- STAC search, ``odc.stac.load``, masking, scaling,
+NDVI, ``xarray`` reductions and ``xarray.apply_ufunc`` -- lives directly in the
+notebooks, because that is what the audience is here to learn.
 
-The module deliberately relies only on the packages already present in
-``environment.yml``.
+The module does not perform any network access on import.
 """
 
 from __future__ import annotations
@@ -31,99 +27,8 @@ import xarray as xr
 
 
 # ---------------------------------------------------------------------------
-# Catalogue endpoints and collection identifiers
+# Cloud-friendly defaults
 # ---------------------------------------------------------------------------
-PLANETARY_COMPUTER_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
-THUENEN_STAC_URL = "https://eodata.thuenen.de/stac/api/v1/"
-
-LANDSAT_COLLECTION = "landsat-c2-l2"          # Microsoft Planetary Computer
-CROP_COLLECTION = "hist-crop-type-map"        # Thuenen historical crop map
-SOIL_COLLECTION = "soil-reflectance-composite"  # Thuenen bare-soil composite
-
-#: Band order inside the Thuenen bare-soil composite COG (asset name ``data``).
-SOIL_BANDS = [
-    "blue",
-    "green",
-    "red",
-    "rededge1",
-    "rededge2",
-    "rededge3",
-    "broadnir",
-    "nir",
-    "swir1",
-    "swir2",
-]
-
-#: Bare-soil composite: nodata value and integer -> reflectance factor.
-#: The STAC metadata advertises ``scale=1`` but the stored values are
-#: reflectance x 10000, so we convert to physical reflectance ourselves.
-SOIL_NODATA = -32768
-SOIL_SCALE = 1e-4
-
-#: Landsat Collection-2 Level-2 surface-reflectance scaling.
-LANDSAT_SCALE = 2.75e-5
-LANDSAT_OFFSET = -0.2
-
-#: QA_PIXEL bits we treat as "not clear sky".
-#:   1 = dilated cloud, 3 = cloud, 4 = cloud shadow.
-LANDSAT_BAD_BITS = (1, 3, 4)
-
-#: Thuenen historical crop-type map (HCTM v101) 14-class legend.
-#: Resolved from Tetteh et al. (2026), "Nationwide annual agricultural
-#: land-use maps of Germany from 1990 to 2023", and verified against the
-#: observed pixel-value histogram.
-THUENEN_CLASSES = {
-    110: "Winter cereals",
-    120: "Summer cereals",
-    130: "Maize",
-    200: "Grassland",
-    1401: "Potato",
-    1402: "Sugar beet",
-    1501: "Rapeseed",
-    1502: "Sunflower",
-    1601: "Legumes",
-    1603: "Horticultural crops",
-    3003: "Fallow land",
-    4001: "Vineyards",
-    4003: "Plantations",
-}
-
-#: RGBA colours for the crop classes, adapted from the official Thuenen
-#: legend (QGIS ``.clr`` files).  Values are 0-255; converted to 0-1 on use.
-THUENEN_COLORS = {
-    110: (251, 251, 22),
-    120: (194, 75, 45),
-    130: (55, 237, 216),
-    200: (105, 194, 41),
-    1401: (195, 125, 238),
-    1402: (154, 12, 238),
-    1501: (238, 67, 156),
-    1502: (227, 0, 247),
-    1601: (94, 176, 132),
-    1603: (251, 33, 17),
-    3003: (178, 206, 68),
-    4001: (130, 128, 186),
-    4003: (106, 81, 163),
-}
-
-
-# ---------------------------------------------------------------------------
-# 1. Client setup and cloud-friendly defaults
-# ---------------------------------------------------------------------------
-def open_planetary_computer():
-    """Return a signed :class:`pystac_client.Client` for Planetary Computer."""
-    import pystac_client
-
-    return pystac_client.Client.open(PLANETARY_COMPUTER_URL)
-
-
-def open_thuenen():
-    """Return a :class:`pystac_client.Client` for the Thuenen STAC API."""
-    import pystac_client
-
-    return pystac_client.Client.open(THUENEN_STAC_URL)
-
-
 def apply_cloud_defaults(
     max_retries: int = 5,
     retry_delay: float = 1.0,
@@ -139,286 +44,120 @@ def apply_cloud_defaults(
     import dask
     import odc.stac
 
-    # GDAL: retry transient HTTP failures instead of crashing.
     os.environ.setdefault("GDAL_HTTP_MAX_RETRIES", str(max_retries))
     os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", str(retry_delay))
     os.environ.setdefault("GDAL_HTTP_TIMEOUT", "60")
 
-    # Dask: limit outgoing connections so we do not trip rate limits.
     dask.config.set({"distributed.worker.connections.outgoing": outgoing_connections})
 
-    # Rasterio: sensible settings for reading Cloud-Optimized GeoTIFFs.
     odc.stac.configure_rio(cloud_defaults=True)
 
 
 # ---------------------------------------------------------------------------
-# 2. Searching STAC catalogues
+# The STAC classification extension -> a tidy legend
 # ---------------------------------------------------------------------------
-def search_signed_landsat(
-    client,
-    bbox,
-    datetime,
-    cloud_cover_lt: float = 30,
-    collections=(LANDSAT_COLLECTION,),
-):
-    """Search Landsat and attach free Planetary Computer SAS tokens.
+def legend_from_item(item, asset: str = "crop_type") -> pd.DataFrame:
+    """Read the class legend embedded in a STAC item asset.
 
-    The items returned by the STAC API point at *private* Azure blobs.  The
-    ``planetary_computer.sign`` helper appends a temporary read token to every
-    asset URL so the data can be streamed without any registration.
+    Categorical assets can carry the `classification <https://github.com/stac-extensions/classification>`_
+    extension: a list of the form ``classification:classes`` where every entry
+    has a numeric ``value``, a human-readable ``title`` and a ``color_hint``.
+    This turns that metadata into a tidy DataFrame (indexed by class value).
     """
-    import planetary_computer
-
-    items = client.search(
-        collections=list(collections),
-        bbox=list(bbox),
-        datetime=datetime,
-        query={"eo:cloud_cover": {"lt": cloud_cover_lt}},
-    ).item_collection()
-    return planetary_computer.sign(items)
+    classes = item.assets[asset].extra_fields.get("classification:classes")
+    if classes is None:
+        raise KeyError(f"Asset '{asset}' of item '{item.id}' has no classification:classes")
+    df = pd.DataFrame(classes)
+    return df.set_index("value").sort_index()
 
 
-def search_crop_types(client, bbox, datetime):
-    """Search the annual Thuenen historical crop-type maps."""
-    return client.search(
-        collections=[CROP_COLLECTION], bbox=list(bbox), datetime=datetime
-    ).item_collection()
+def hex_to_rgb(color_hint: str):
+    """Convert a ``color_hint`` hex string such as ``'37EDD8'`` to 0-255 RGB."""
+    h = color_hint.lstrip("#")
+    return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
 
 
-def search_soil_composite(client, bbox):
-    """Search the Thuenen bare-soil reflectance composite (one national item)."""
-    return client.search(
-        collections=[SOIL_COLLECTION], bbox=list(bbox)
-    ).item_collection()
+def legend_colors(legend: pd.DataFrame) -> dict:
+    """Map every class value in ``legend`` to an (r, g, b) tuple."""
+    return {int(v): hex_to_rgb(legend.loc[v, "color_hint"]) for v in legend.index}
+
+
+def _remap_codes(data: np.ndarray, codes) -> np.ndarray:
+    """Replace class values by their position in ``codes`` (NaN stays NaN)."""
+    remapped = np.full(data.shape, np.nan)
+    for i, code in enumerate(codes):
+        remapped[data == code] = i
+    return remapped
 
 
 # ---------------------------------------------------------------------------
-# 3. Loading data lazily with odc-stac
-# ---------------------------------------------------------------------------
-def load_landsat(
-    items,
-    bbox,
-    bands=("red", "nir08", "qa_pixel"),
-    resolution: int = 30,
-    chunks=(32, 256, 256),
-    groupby: str = "solar_day",
-):
-    """Turn signed Landsat STAC items into a *lazy* xarray.Dataset.
-
-    ``groupby="solar_day"`` merges scenes that were acquired on the same day
-    (e.g. overlapping paths) into a single timestep.  The ``chunks`` argument
-    is what makes this cloud-native: instead of downloading every pixel, we
-    describe the dataset as a grid of Dask blocks and only fetch the blocks we
-    actually touch.  Note the format ``(time, x, y)``.
-    """
-    import odc.stac
-
-    time_chunk, x_chunk, y_chunk = chunks
-    return odc.stac.load(
-        items,
-        bands=list(bands),
-        bbox=list(bbox),
-        resolution=resolution,
-        chunks={"time": time_chunk, "x": x_chunk, "y": y_chunk},
-        groupby=groupby,
-        fail_on_error=False,
-    )
-
-
-def load_crop_types(
-    items,
-    geobox=None,
-    bbox=None,
-    bbox_crs: str = "EPSG:4326",
-    crs: str = "EPSG:3035",
-    resolution: int = 30,
-    chunks=(-1, 256, 256),
-    resampling: str = "nearest",
-):
-    """Load the Thuenen crop-type maps, optionally aligned to a target grid.
-
-    Pass ``geobox`` to resample onto an existing grid (used to line the crops
-    up with Landsat or with the soil composite), or ``bbox``/``crs``/
-    ``resolution`` to define a fresh grid.  ``time`` is left unchunked
-    (``-1``) because the majority-vote later needs the full time axis per
-    spatial block.
-    """
-    import odc.stac
-
-    time_chunk, x_chunk, y_chunk = chunks
-    kwargs = dict(
-        bands=["crop_type"],
-        chunks={"time": time_chunk, "x": x_chunk, "y": y_chunk},
-        resampling=resampling,
-        fail_on_error=False,
-    )
-    if geobox is not None:
-        kwargs["geobox"] = geobox
-    else:
-        kwargs.update(bbox=list(bbox), bbox_crs=bbox_crs, crs=crs, resolution=resolution)
-    return odc.stac.load(items, **kwargs)
-
-
-def load_soil_composite(items, geobox, chunks=(256, 256)):
-    """Stream the bare-soil composite and return physical reflectance.
-
-    The composite is a single multi-band Cloud-Optimized GeoTIFF, so
-    ``odc-stac`` names the bands ``data.1`` ... ``data.10``.  We rename them
-    to meaningful names, replace the ``-32768`` nodata value with ``NaN`` and
-    convert the stored integers to reflectance.  Because ``geobox`` is given,
-    the result is pixel-aligned with the crop-type grid.
-    """
-    import odc.stac
-
-    x_chunk, y_chunk = chunks
-    ds = odc.stac.load(
-        items,
-        geobox=geobox,
-        chunks={"x": x_chunk, "y": y_chunk},
-        fail_on_error=False,
-    ).squeeze(drop=True)
-
-    rename = {
-        f"data.{i + 1}": band
-        for i, band in enumerate(SOIL_BANDS)
-        if f"data.{i + 1}" in ds
-    }
-    ds = ds.rename(rename)
-    ds = ds.where(ds != SOIL_NODATA) * SOIL_SCALE
-    return ds
-
-
-# ---------------------------------------------------------------------------
-# 4. Landsat masking, scaling and NDVI
-# ---------------------------------------------------------------------------
-def landsat_clear_mask(ds, qa_band: str = "qa_pixel", bad_bits=LANDSAT_BAD_BITS):
-    """Boolean mask that is ``True`` for clear-sky pixels.
-
-    The Landsat ``QA_PIXEL`` band is a bit mask.  We flag a pixel as cloudy if
-    *any* of the selected bits is set.  This stays lazy: no data is read yet.
-    """
-    flag = 0
-    for bit in bad_bits:
-        flag |= 1 << bit
-    return (ds[qa_band] & flag) == 0
-
-
-def scale_landsat(da):
-    """Convert Landsat Collection-2 Level-2 digital numbers to reflectance."""
-    return da * LANDSAT_SCALE + LANDSAT_OFFSET
-
-
-def compute_ndvi(ds, red: str = "red", nir: str = "nir08", clear_mask=None, clip: bool = True):
-    """Compute NDVI from scaled, masked red and NIR bands.
-
-    Everything here stays lazy: we are only *describing* an operation on the
-    Dask graph.  Passing ``clear_mask`` sets cloudy pixels to ``NaN`` so they
-    never influence later statistics.  Because the surface-reflectance offset
-    can push dark pixels slightly below zero (and therefore NDVI slightly
-    above one), we clip the result to the physically meaningful range.
-    """
-    red_da = scale_landsat(ds[red])
-    nir_da = scale_landsat(ds[nir])
-    if clear_mask is not None:
-        red_da = red_da.where(clear_mask)
-        nir_da = nir_da.where(clear_mask)
-    ndvi = (nir_da - red_da) / (nir_da + red_da)
-    if clip:
-        ndvi = ndvi.clip(-1.0, 1.0)
-    return ndvi
-
-
-def annual_peak_ndvi(ndvi, time_dim: str = "time"):
-    """Day-of-year of the maximum NDVI for every year and pixel.
-
-    We group the time series by calendar year and ask each year for the date of
-    its highest NDVI.  ``skipna=True`` ignores fully cloudy pixels instead of
-    raising an error.  The result has dimensions ``(year, y, x)``.
-    """
-    annual = ndvi.groupby(f"{time_dim}.year")
-    peak_time = annual.map(lambda x: x.idxmax(dim=time_dim, skipna=True))
-    return peak_time.dt.dayofyear
-
-
-# ---------------------------------------------------------------------------
-# 5. Majority crop per pixel (categorical time series)
-# ---------------------------------------------------------------------------
-def _mode_ignore_nan(arr, axis=-1):
-    """Return the mode along ``axis`` while ignoring NaN (scipy wrapper)."""
-    from scipy.stats import mode
-
-    return mode(arr, axis=axis, keepdims=False, nan_policy="omit").mode
-
-
-def majority_crop(crop_ds, variable: str = "crop_type", time_dim: str = "time"):
-    """Most frequent crop class per pixel across all years.
-
-    Two important details:
-
-    * ``0`` is the product's nodata value (i.e. "not agricultural land").  We
-      turn it into ``NaN`` so it can never win the vote.
-    * We use :func:`xarray.apply_ufunc` with ``dask="parallelized"`` so the
-      reduction runs block-by-block on the Dask cluster; the time dimension is
-      the "core" dimension and disappears from the result.
-    """
-    da = crop_ds[variable]
-    da = da.where(da != 0).astype("float32")
-    return xr.apply_ufunc(
-        _mode_ignore_nan,
-        da,
-        input_core_dims=[[time_dim]],
-        output_core_dims=[[]],
-        kwargs={"axis": -1},
-        dask="parallelized",
-        output_dtypes=["float32"],
-    ).rename("majority_crop")
-
-
-def build_spectra_dataframe(
-    soil_ds,
-    majority,
-    crop_codes,
-    bands=SOIL_BANDS,
-    mask_quantile: float = 0.01,
-):
-    """Sample the bare-soil spectrum of every pixel by its majority crop.
-
-    For each requested crop we keep the pixels where that crop is the
-    historical majority, drop nodata, and stack everything into one tidy
-    DataFrame with one row per pixel.
-    """
-    frames = []
-    for name, code in crop_codes.items():
-        masked = soil_ds[bands].where(majority == code)
-        df = masked.to_dataframe().dropna()
-        if df.empty:
-            continue
-        for band in bands:
-            lo, hi = df[band].quantile([mask_quantile, 1 - mask_quantile])
-            df = df[df[band].between(lo, hi)]
-        df = df.reset_index(drop=True)
-        df["Crop"] = name
-        frames.append(df)
-    if not frames:
-        raise ValueError("No pixels found for the requested crop codes.")
-    return pd.concat(frames, ignore_index=True)
-
-
-def add_chromaticity_axes(df):
-    """Add the two colour axes used in the bare-soil chromaticity plot."""
-    df = df.copy()
-    df["x_ax"] = df["red"] / df["green"]
-    df["y_ax"] = df["blue"] / (df["red"] + df["green"] + df["blue"])
-    return df
-
-
-# ---------------------------------------------------------------------------
-# 6. Plotting helpers
+# Plotting helpers
 # ---------------------------------------------------------------------------
 def _import_matplotlib():
     import matplotlib.pyplot as plt
 
     return plt
+
+
+def plot_legend(legend: pd.DataFrame, title: str = "Crop-type legend (from STAC)",
+                savepath: str | None = None):
+    """Draw the legend as a strip of colour swatches with class names."""
+    plt = _import_matplotlib()
+
+    colors = [np.array(hex_to_rgb(legend.loc[v, "color_hint"])) / 255 for v in legend.index]
+    titles = [str(legend.loc[v, "title"]) for v in legend.index]
+
+    fig, ax = plt.subplots(figsize=(7, 0.45 * len(titles) + 0.6))
+    for i, (color, name) in enumerate(zip(colors, titles)):
+        y = len(titles) - i - 1
+        ax.add_patch(plt.Rectangle((0, y - 0.35), 0.9, 0.7, color=color))
+        ax.text(1.05, y, f"{name}  ({int(legend.index[i])})", va="center", fontsize=9)
+    ax.set_xlim(0, 6)
+    ax.set_ylim(-0.7, len(titles) - 0.3)
+    ax.axis("off")
+    ax.set_title(title, loc="left")
+    fig.tight_layout()
+    if savepath:
+        fig.savefig(savepath, dpi=300, bbox_inches="tight")
+    return fig, ax
+
+
+def plot_classified_map(
+    majority,
+    legend: pd.DataFrame,
+    title: str = "Historical majority crop type",
+    savepath: str | None = None,
+):
+    """Show a categorical raster using the official STAC colours."""
+    plt = _import_matplotlib()
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    from matplotlib.patches import Patch
+
+    codes = [int(c) for c in sorted(legend.index)]
+    colors = [np.array(hex_to_rgb(legend.loc[c, "color_hint"])) / 255 for c in codes]
+    cmap = ListedColormap(colors)
+    cmap.set_bad("white")
+    norm = BoundaryNorm(np.arange(len(codes) + 1) - 0.5, cmap.N)
+
+    remapped = _remap_codes(np.asarray(majority.values), codes)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.imshow(remapped, cmap=cmap, norm=norm, interpolation="nearest")
+    handles = [
+        Patch(facecolor=colors[i], label=str(legend.loc[c, "title"]))
+        for i, c in enumerate(codes)
+    ]
+    ax.legend(
+        handles=handles, loc="center left", bbox_to_anchor=(1.02, 0.5),
+        fontsize=8, title="Class",
+    )
+    ax.set_title(title)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.tight_layout()
+    if savepath:
+        fig.savefig(savepath, dpi=300, bbox_inches="tight")
+    return fig, ax
 
 
 def plot_peak_phenology(
@@ -439,12 +178,7 @@ def plot_peak_phenology(
         ax.plot(group[year_col], group[doy_col], marker="o", label=crop)
         if len(group) > 1:
             slope, intercept = np.polyfit(group[year_col], group[doy_col], 1)
-            ax.plot(
-                group[year_col],
-                slope * group[year_col] + intercept,
-                linestyle="--",
-                alpha=0.7,
-            )
+            ax.plot(group[year_col], slope * group[year_col] + intercept, linestyle="--", alpha=0.7)
             trends[crop] = slope * 10  # change per decade
     ax.set_title(title)
     ax.set_xlabel("Year")
@@ -457,47 +191,9 @@ def plot_peak_phenology(
     return fig, ax, trends
 
 
-def plot_classified_map(
-    majority,
-    classes=THUENEN_CLASSES,
-    colors=THUENEN_COLORS,
-    title: str = "Historical majority crop type",
-    savepath: str | None = None,
-):
-    """Show the majority-crop raster with the official Thuenen colours."""
-    plt = _import_matplotlib()
-    from matplotlib.colors import ListedColormap, BoundaryNorm
-    from matplotlib.patches import Patch
-
-    codes = sorted(classes)
-    cmap = ListedColormap([np.array(colors[c]) / 255 for c in codes])
-    cmap.set_bad("white")
-    norm = BoundaryNorm(np.arange(len(codes) + 1) - 0.5, cmap.N)
-
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(majority, cmap=cmap, norm=norm, interpolation="nearest")
-    handles = [
-        Patch(facecolor=np.array(colors[c]) / 255, label=classes[c]) for c in codes
-    ]
-    ax.legend(
-        handles=handles,
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        fontsize=8,
-        title="Class",
-    )
-    ax.set_title(title)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    fig.tight_layout()
-    if savepath:
-        fig.savefig(savepath, dpi=300, bbox_inches="tight")
-    return fig, ax
-
-
 def plot_mean_spectra(
     soil_df,
-    bands=SOIL_BANDS,
+    bands,
     crop_col: str = "Crop",
     title: str = "Average bare-soil spectrum by dominant crop type",
     savepath: str | None = None,
@@ -557,40 +253,20 @@ def plot_chromaticity(
     colors = np.clip(sample[["red", "green", "blue"]].values / display_max, 0, 1)
 
     fig, ax = plt.subplots(figsize=(10, 8))
-    ax.scatter(
-        sample["x_ax"],
-        sample["y_ax"],
-        c=colors,
-        alpha=0.15,
-        s=50,
-        edgecolors="none",
-        zorder=1,
-    )
+    ax.scatter(sample["x_ax"], sample["y_ax"], c=colors, alpha=0.15, s=50,
+               edgecolors="none", zorder=1)
 
     palette = plt.get_cmap("tab10")
     for i, crop in enumerate(soil_df[crop_col].unique()):
         crop_data = soil_df[soil_df[crop_col] == crop]
         color = palette(i % palette.N)
         add_confidence_ellipse(
-            crop_data["x_ax"],
-            crop_data["y_ax"],
-            ax=ax,
-            n_std=1.0,
-            edgecolor=color,
-            facecolor="none",
-            linewidth=2.5,
-            zorder=3,
+            crop_data["x_ax"], crop_data["y_ax"], ax=ax, n_std=1.0,
+            edgecolor=color, facecolor="none", linewidth=2.5, zorder=3,
             label=f"{crop} (1σ)",
         )
-        ax.scatter(
-            crop_data["x_ax"].mean(),
-            crop_data["y_ax"].mean(),
-            color=color,
-            marker="X",
-            s=120,
-            zorder=4,
-            edgecolors="black",
-        )
+        ax.scatter(crop_data["x_ax"].mean(), crop_data["y_ax"].mean(), color=color,
+                   marker="X", s=120, zorder=4, edgecolors="black")
 
     ax.set_title(title, pad=15, fontsize=14)
     ax.set_xlabel("Red / green ratio", fontsize=12)
@@ -605,8 +281,63 @@ def plot_chromaticity(
     return fig, ax
 
 
+def make_crop_gif(
+    crop_stack,
+    legend: pd.DataFrame,
+    path: str = "crop_type_animation.gif",
+    fps: int = 2,
+    title: str = "Annual crop types",
+):
+    """Render a stack of annual crop maps as an animated GIF.
+
+    ``crop_stack`` is a 3-D array-like with dimensions ``(time, y, x)`` holding
+    class codes; ``legend`` is the DataFrame produced by :func:`legend_from_item`.
+    The official STAC colours are used, and missing data is drawn white.
+    """
+    plt = _import_matplotlib()
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    from matplotlib.patches import Patch
+
+    codes = [int(c) for c in sorted(legend.index)]
+    colors = [np.array(hex_to_rgb(legend.loc[c, "color_hint"])) / 255 for c in codes]
+    cmap = ListedColormap(colors)
+    cmap.set_bad("white")
+    norm = BoundaryNorm(np.arange(len(codes) + 1) - 0.5, cmap.N)
+
+    data = np.asarray(crop_stack.values)
+    remapped = _remap_codes(data, codes)
+
+    if "time" in getattr(crop_stack, "coords", {}):
+        years = [pd.Timestamp(t).year for t in pd.to_datetime(crop_stack.time.values)]
+    else:
+        years = list(range(len(remapped)))
+
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    image = ax.imshow(remapped[0], cmap=cmap, norm=norm, interpolation="nearest")
+    handles = [
+        Patch(facecolor=colors[i], label=str(legend.loc[c, "title"]))
+        for i, c in enumerate(codes)
+    ]
+    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
+              fontsize=7, title="Class")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    title_artist = ax.set_title(f"{title} - {years[0]}")
+
+    def update(frame):
+        image.set_data(remapped[frame])
+        title_artist.set_text(f"{title} - {years[frame]}")
+        return image, title_artist
+
+    anim = FuncAnimation(fig, update, frames=len(remapped), interval=1000 / fps, blit=False)
+    anim.save(path, writer=PillowWriter(fps=fps))
+    plt.close(fig)
+    return path
+
+
 # ---------------------------------------------------------------------------
-# 7. Dask teaching helpers -- "what is Dask actually doing?"
+# Dask teaching helpers -- "what is Dask actually doing?"
 # ---------------------------------------------------------------------------
 def human_bytes(n: float) -> str:
     """Format a number of bytes in a human-friendly way."""
@@ -620,9 +351,7 @@ def human_bytes(n: float) -> str:
 
 def _as_variables(obj):
     if isinstance(obj, xr.Dataset):
-        label = "Dataset ({})".format(
-            ", ".join(f"{k}: {v}" for k, v in obj.sizes.items())
-        )
+        label = "Dataset ({})".format(", ".join(f"{k}: {v}" for k, v in obj.sizes.items()))
         return label, list(obj.data_vars.items())
     if isinstance(obj, xr.DataArray):
         label = f"DataArray '{obj.name}' ({', '.join(f'{k}: {v}' for k, v in obj.sizes.items())})"
@@ -633,9 +362,9 @@ def _as_variables(obj):
 def dask_report(obj, title: str = "Dask report"):
     """Print what is declared, how it is chunked, and whether it is materialised.
 
-    This is the single best teaching tool for cloud-native workflows: it shows
-    that a multi-gigabyte dataset can be *described* while occupying almost no
-    memory, because nothing has been read yet.
+    The single best teaching tool for cloud-native workflows: it shows that a
+    large dataset can be *described* while occupying no memory, because nothing
+    has been read yet.
     """
     label, variables = _as_variables(obj)
 
@@ -649,7 +378,6 @@ def dask_report(obj, title: str = "Dask report"):
     for name, da in variables:
         dim_chunks = getattr(da, "chunks", None)
         if dim_chunks:
-            # Show the nominal chunk extent per dimension (first block).
             chunk_str = "(" + ", ".join(str(c[0]) for c in dim_chunks) + ")"
         else:
             chunk_str = "in memory"
@@ -678,7 +406,7 @@ def dask_report(obj, title: str = "Dask report"):
 
 @contextmanager
 def compute_with_progress():
-    """Context manager that shows a live Dask progress bar during ``.compute()``.
+    """Context manager showing a live Dask progress bar during ``.compute()``.
 
     Usage::
 
@@ -695,8 +423,7 @@ def start_dashboard(address: str = ":8787"):
     """Bonus: start a local Dask cluster with a live dashboard.
 
     Open the printed dashboard URL in a browser to watch tasks stream in from
-    the cloud in real time.  Kept optional so the core workflow has no extra
-    dependencies.
+    the cloud in real time.
     """
     from distributed import Client
 
@@ -704,37 +431,17 @@ def start_dashboard(address: str = ":8787"):
 
 
 __all__ = [
-    "PLANETARY_COMPUTER_URL",
-    "THUENEN_STAC_URL",
-    "LANDSAT_COLLECTION",
-    "CROP_COLLECTION",
-    "SOIL_COLLECTION",
-    "SOIL_BANDS",
-    "SOIL_NODATA",
-    "SOIL_SCALE",
-    "THUENEN_CLASSES",
-    "THUENEN_COLORS",
-    "open_planetary_computer",
-    "open_thuenen",
     "apply_cloud_defaults",
-    "search_signed_landsat",
-    "search_crop_types",
-    "search_soil_composite",
-    "load_landsat",
-    "load_crop_types",
-    "load_soil_composite",
-    "landsat_clear_mask",
-    "scale_landsat",
-    "compute_ndvi",
-    "annual_peak_ndvi",
-    "majority_crop",
-    "build_spectra_dataframe",
-    "add_chromaticity_axes",
-    "plot_peak_phenology",
+    "legend_from_item",
+    "hex_to_rgb",
+    "legend_colors",
+    "plot_legend",
     "plot_classified_map",
+    "plot_peak_phenology",
     "plot_mean_spectra",
     "add_confidence_ellipse",
     "plot_chromaticity",
+    "make_crop_gif",
     "human_bytes",
     "dask_report",
     "compute_with_progress",
